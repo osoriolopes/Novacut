@@ -1,0 +1,7 @@
+{
+  "name": "novacut",
+  "productName": "NovaCut",
+  "version": "3.0.2",
+  "description": "NovaCut - editor de vídeo",
+  "main": "main.js"
+}

@@ -1321,8 +1321,9 @@ function processPixels(c, el, sx, sy, sw, sh) {
 }
 function getSource(c, t) {
   if (c.kind === 'compound') { const [W, H] = projRes(); return renderCompound(c, t, W, H); }
-  const m = MEDIA[c.mediaId]; if (!m || !m.ready || !m.el || !m.w) return null;
-  const ex = EXPF && c.kind === 'video' ? EXPF.get(c.id) : null;
+  const m = MEDIA[c.mediaId], ex = EXPF && c.kind === 'video' ? EXPF.get(c.id) : null;
+  // export draws the decoded frame: the media's own player may be asleep (big projects keep at most PLAYER_CAP open)
+  if (!m || !m.ready || !m.w || (!m.el && !ex)) return null;
   // a second copy of the same video on screen at the same time gets its own player (otherwise both would show the same frame)
   let dup = null; if (!ex && c.kind === 'video') { const list = activeOf(m.id, t); if (list.length > 1 && list[0].id !== c.id && list.some(x => x.id === c.id)) dup = dupFor(m, c); }
   const pl = dup ? dup.el : m.el, el = ex || pl, ps = dup || m;
@@ -1912,7 +1913,8 @@ function drawClipRaw(c, t, W, H) {
   else if (c.kind === 'color') drawGen(c, l, R);
   else {
     const src = getSource(c, t);
-    if (!src) { ctx.filter = 'none'; ctx.fillStyle = '#2a1517'; ctx.fillRect(-R.w / 2, -R.h / 2, R.w, R.h); ctx.fillStyle = '#e5484d'; ctx.font = `700 ${H * .035}px Manrope,sans-serif`; ctx.textAlign = 'center'; const mm = MEDIA[c.mediaId]; ctx.fillText((mm && (mm.loadError || mm.broken) ? 'Não abre: ' : mm && !mm.offline ? 'Carregando: ' : 'Mídia offline: ') + (c.name || ''), 0, 0); if (mm && mm.dormant) wakeMedia(mm); }
+    if (!src && EXPF) { if (!EXP.missLog) EXP.missLog = new Set(); if (!EXP.missLog.has(c.id)) { EXP.missLog.add(c.id); hlog(`exportação: sem quadro de "${c.name}" em ${t.toFixed(3)}s`); } }   // never burn the "Carregando" card into a file
+    else if (!src) { ctx.filter = 'none'; ctx.fillStyle = '#2a1517'; ctx.fillRect(-R.w / 2, -R.h / 2, R.w, R.h); ctx.fillStyle = '#e5484d'; ctx.font = `700 ${H * .035}px Manrope,sans-serif`; ctx.textAlign = 'center'; const mm = MEDIA[c.mediaId]; ctx.fillText((mm && (mm.loadError || mm.broken) ? 'Não abre: ' : mm && !mm.offline ? 'Carregando: ' : 'Mídia offline: ') + (c.name || ''), 0, 0); if (mm && mm.dormant) wakeMedia(mm); }
     else {
       const cover = c.region ? c.fit !== 'contain-r' : (c.fit === 'cover' || (c.pz && c.pz.on));
       const s = cover ? Math.max(R.w / src.sw, R.h / src.sh) : Math.min(R.w / src.sw, R.h / src.sh);
@@ -3584,7 +3586,7 @@ async function openRecorder(mode, placeAt) {
 }
 
 /* ---------- preferences ---------- */
-const APP_VERSION = '3.0.2';   // must match electron/app/package.json (the installer build checks it)
+const APP_VERSION = '3.0.3';   // must match electron/app/package.json (the installer build checks it)
 const PREFS = Object.assign({ openLast: true, previewQ: 1, imgDur: 5, titleDur: 4, transDur: .8, freezeDur: 3, askRes: true, autoJoin: true, resChoice: 'project', autosave: true, keepVersions: 20, gpu: 'auto', hwRender: true, hwDecode: true, proxy: true, autoProxy: true, memWarn: true, autoRes: true, saveCaptures: true, copyMedia: false },
   (() => { try { return JSON.parse(localStorage.getItem('novacut.prefs') || '{}'); } catch { return {}; } })());
 function savePrefs() { try { localStorage.setItem('novacut.prefs', JSON.stringify(PREFS)); } catch {} }
@@ -4668,7 +4670,13 @@ async function exportVideo(from, to, finish) {
   EXP.rec = rec; rec.start(250); play(to);
 }
 function finishExport() { if (EXP.rec && EXP.rec.state !== 'inactive') EXP.rec.stop(); }
-async function renderAt(t) { S.t = t; draw(); for (let i = 0; i < 100 && Object.values(MEDIA).some(m => m.seeking); i++) await new Promise(r => setTimeout(r, 10)); draw(); }
+// a frame for a file (GIF): asleep players of the clips on screen are woken first and awaited, so no "Carregando" card is captured
+async function renderAt(t) {
+  S.t = t; const need = flatClips().filter(c => c.mediaId && c.kind !== 'audio' && t >= c.start && t < c.start + c.dur).map(c => MEDIA[c.mediaId]).filter(m => m && !m.offline);
+  need.forEach(m => { if (m.dormant) wakeMedia(m); });
+  for (let i = 0; i < 300 && need.some(m => m.waking || (m.dormant && !m.broken && !m.loadError)); i++) await new Promise(r => setTimeout(r, 10));
+  draw(); for (let i = 0; i < 100 && Object.values(MEDIA).some(m => m.seeking); i++) await new Promise(r => setTimeout(r, 10)); draw();
+}
 const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
 const GIF_PAL = (() => { const p = new Uint8Array(768); let i = 0; for (let r = 0; r < 6; r++) for (let g = 0; g < 7; g++) for (let b = 0; b < 6; b++) { p[i++] = r * 51; p[i++] = Math.round(g * 42.5); p[i++] = b * 51; } return p; })();
 function quantize(im) { const d = im.data, w = im.width, n = w * im.height, out = new Uint8Array(n); for (let j = 0, p = 0; j < n; j++, p += 4) { const x = j % w, y = (j / w) | 0, t = BAYER[(y & 3) * 4 + (x & 3)] / 16 - .47; out[j] = clamp(Math.round(d[p] / 51 + t), 0, 5) * 42 + clamp(Math.round(d[p + 1] / 42.5 + t), 0, 6) * 6 + clamp(Math.round(d[p + 2] / 51 + t), 0, 5); } return out; }
@@ -6392,7 +6400,7 @@ async function exportVideoWC(from, to, out) {
       if (!demux.has(m.id)) { let d = null; if (window.VideoDecoder) { try { d = await demuxMp4(m); } catch { d = null; } } demux.set(m.id, d); }
       const d = demux.get(m.id); r = d ? new WCReader(d) : new SeekReader(m); readers.set(key, r); return r;
     };
-    EXP.size = [ow, oh]; EXP.active = true; EXP.scale = ow / W; EXPF = new Map(); pause();
+    EXP.size = [ow, oh]; EXP.active = true; EXP.scale = ow / W; EXPF = new Map(); EXP.missLog = null; pause();
     const N = Math.max(1, Math.round((to - from) * fr.num / fr.den)), key = Math.max(1, Math.round(fps * 2));
     P.update(0, N, 'Gerando vídeo'); const PT = { dec: 0, draw: 0, enc: 0, wait: 0 };
     for (let i = 0; i < N; i++) {

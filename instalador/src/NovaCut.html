@@ -3586,7 +3586,7 @@ async function openRecorder(mode, placeAt) {
 }
 
 /* ---------- preferences ---------- */
-const APP_VERSION = '3.0.3';   // must match electron/app/package.json (the installer build checks it)
+const APP_VERSION = '3.0.4';   // must match electron/app/package.json (the installer build checks it)
 const PREFS = Object.assign({ openLast: true, previewQ: 1, imgDur: 5, titleDur: 4, transDur: .8, freezeDur: 3, askRes: true, autoJoin: true, resChoice: 'project', autosave: true, keepVersions: 20, gpu: 'auto', hwRender: true, hwDecode: true, proxy: true, autoProxy: true, memWarn: true, autoRes: true, saveCaptures: true, copyMedia: false },
   (() => { try { return JSON.parse(localStorage.getItem('novacut.prefs') || '{}'); } catch { return {}; } })());
 function savePrefs() { try { localStorage.setItem('novacut.prefs', JSON.stringify(PREFS)); } catch {} }
@@ -6565,6 +6565,7 @@ function deleteGap() {
   const g = S.gap; if (!g) return; const len = g.end - g.start;
   S.clips.forEach(c => { if (c.track === g.track && c.start >= g.end - 1e-3) c.start -= len; });
   S.gap = null; commit('Excluir e juntar espaço');
+  if (S.playing) pause(); seek(g.start);   // playhead at the join, as when a clip is deleted and joined
 }
 let marq = null;
 
@@ -7208,7 +7209,7 @@ lanes.addEventListener('contextmenu', e => {
   if (e.target.closest('#ruler')) return showMenu(e.clientX, e.clientY, [{ l: 'Adicionar marcador aqui', a: () => addMarker(t) }, { l: 'Marcar entrada aqui', k: 'I', a: () => { seek(t); setRange('in'); } }, { l: 'Marcar saída aqui', k: 'O', a: () => { seek(t); setRange('out'); } }, { l: 'Limpar entrada/saída', d: !S.range, a: () => { S.range = null; commit('Limpar intervalo'); } }, '-', { l: 'Remover marcadores de batida', d: !S.markers.some(m => m.kind === 'beat'), a: () => { S.markers = S.markers.filter(m => m.kind !== 'beat'); commit('Remover batidas'); } }]);
   const lane = e.target.closest('.lane[data-track]');
   const g = lane && gapAt(lane.dataset.track, t);
-  if (g) { S.sel = []; updateSel(); S.gap = g; renderGap(); return showMenu(e.clientX, e.clientY, [{ l: 'Excluir e Juntar', k: 'Shift+Delete', a: deleteGap }, '-', { l: 'Activar Junção da Linha de Tempo', chk: S.snap, a: toggleSnap }]); }
+  if (g) { S.sel = []; updateSel(); S.gap = g; renderGap(); return showMenu(e.clientX, e.clientY, [{ l: 'Excluir e Juntar', k: 'Shift+Delete', a: deleteGap }, '-', { l: 'Ativar Junção da Linha de Tempo', chk: S.snap, a: toggleSnap }]); }
   showMenu(e.clientX, e.clientY, [{ l: 'Colar aqui', k: 'Ctrl+V', d: !clipboardData(), a: () => paste(t) }, { l: 'Excluir espaços desta faixa', d: !lane || !hasGaps(lane.dataset.track), a: () => closeGaps([lane.dataset.track]) }, { l: 'Adicionar marcador aqui', a: () => addMarker(t) }, '-', { l: 'Ativar Junção da Linha de Tempo', chk: S.snap, a: toggleSnap }]);
 });
 // drag & drop from library onto timeline

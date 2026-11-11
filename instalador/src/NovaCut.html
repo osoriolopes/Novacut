@@ -686,12 +686,13 @@ const IDB = (() => {
       const r = indexedDB.open('novacut', 2);
       r.onupgradeneeded = () => { const db = r.result; if (!db.objectStoreNames.contains('media')) db.createObjectStore('media', { keyPath: 'id' }); if (!db.objectStoreNames.contains('projects')) db.createObjectStore('projects', { keyPath: 'id' }); };
       r.onblocked = () => toast('Feche as outras janelas do NovaCut para terminar a atualização');
-      r.onsuccess = () => { clearTimeout(to); const db = r.result; db.onversionchange = () => { db.close(); dbp = null; }; res(db); };
+      r.onsuccess = () => { clearTimeout(to); const db = r.result; db.onversionchange = () => { db.close(); dbp = null; }; db.onclose = () => { dbp = null; }; res(db); };
       r.onerror = () => { clearTimeout(to); dbp = null; rej(r.error); };
     } catch (e) { clearTimeout(to); dbp = null; rej(e); }
   }));
-  const tx = async (store, mode, fn) => { const db = await open(); return new Promise((res, rej) => { const t = db.transaction(store, mode); const r = fn(t.objectStore(store)); t.oncomplete = () => res(r && r.result); t.onerror = () => rej(t.error); }); };
-  const api = st => ({ put: rec => tx(st, 'readwrite', s => s.put(rec)).catch(() => {}), del: id => tx(st, 'readwrite', s => s.delete(id)).catch(() => {}), all: () => tx(st, 'readonly', s => s.getAll()).catch(() => []), get: id => tx(st, 'readonly', s => s.get(id)).catch(() => null) });
+  const tx = async (store, mode, fn) => { const db = await open(); return new Promise((res, rej) => { const t = db.transaction(store, mode); const r = fn(t.objectStore(store)); t.oncomplete = () => res(r && r.result); t.onerror = () => rej(t.error || new Error('falha na gravação')); t.onabort = () => rej(t.error || new Error('a gravação foi interrompida (pode faltar espaço no disco)')); }); };
+  // put/del/all/get never fail (used where a miss is harmless); putStrict/getStrict tell the truth: the project save depends on them
+  const api = st => ({ putStrict: rec => tx(st, 'readwrite', s => s.put(rec)), getStrict: id => tx(st, 'readonly', s => s.get(id)), put: rec => tx(st, 'readwrite', s => s.put(rec)).catch(() => {}), del: id => tx(st, 'readwrite', s => s.delete(id)).catch(() => {}), all: () => tx(st, 'readonly', s => s.getAll()).catch(() => []), get: id => tx(st, 'readonly', s => s.get(id)).catch(() => null) });
   return Object.assign(api('media'), { proj: api('projects') });
 })();
 
@@ -900,7 +901,7 @@ async function decodePeaks(m, blob) {
       const dur = ix.kind === 'wav' ? ix.len / ix.ba / ix.sr : ix.samples.reduce((s, p) => Math.max(s, p.t + p.dur), 0);
       peaks = new Float32Array(Math.max(1, Math.ceil(dur * 100)));
       for (let a = 0; a < dur; a += 60) {
-        await bgIdle(); const r = await audioRange(m, a, Math.min(dur, a + 60), 8000); if (!r) break;
+        await bgIdle(); const r = await audioRange(m, a, Math.min(dur, a + 60), 8000); if (!r) continue;
         const P = computePeaks(r.buf), base = Math.round(r.t0 * 100), lo = Math.round(a * 100), hi = Math.min(peaks.length, Math.round((a + 60) * 100));
         for (let j = 0; j < P.length; j++) { const k = base + j; if (k >= lo && k < hi) peaks[k] = P[j]; }
       }
@@ -985,6 +986,7 @@ const elSlot = () => new Promise(r => { if (ELSLOT.n < 3) { ELSLOT.n++; r(); } e
 const elFree = () => { const r = ELSLOT.q.shift(); if (r) r(); else ELSLOT.n--; };
 // closes a player completely: stops it, releases the file and the decoder, takes it out of the page and out of the audio graph
 function dropEl(m) {
+  dropSpare(m);
   try { if (m.fx && m.fx.out) m.fx.out.disconnect(); } catch {} try { if (m.gain) m.gain.disconnect(); } catch {}
   if (m.el && m.kind !== 'image') { try { m.el.pause(); m.el.removeAttribute('src'); m.el.load(); m.el.remove(); } catch {} }
   m.el = null; m.gain = null; m.fx = null;
@@ -1029,11 +1031,12 @@ function sleepMedia(m) {
 }
 // every open player of media (separated audio and built-in sounds included) plus the extra players of repeated media
 const livePlayers = () => Object.values(MEDIA).filter(m => m.el && !m.dormant && m.kind !== 'image');
-const playerCount = () => livePlayers().length + DUPS.size;
+const playerCount = () => { const l = livePlayers(); return l.length + l.filter(m => m.spare).length + DUPS.size; };
 // strict limit: at most PLAYER_CAP players. The media wanted are ranked (on screen now, then by distance to the playhead,
 // selected clips count as near) and only the first PLAYER_CAP get a player; players of media this project does not use close at once
 function managePlayers() {
   if (EXP.busy) return;
+  if (!S.playing) for (const m of Object.values(MEDIA)) if (m.spare) dropSpare(m);   // the waiting players of the cuts exist only while playing
   const t = S.t, all = flatClips(), used = new Set(), dist = new Map();
   for (const c of all) {
     if (!c.mediaId) continue; const id = c.mediaId; used.add(id);   // a separated audio ("~a") is a player of its own
@@ -2032,8 +2035,62 @@ function playEl(el, c, t, fx, gainNode, setG) {
   el.preservesPitch = rampOn(c) ? false : c.pitch !== false;
   if (fx) setFx(fx, c.afx);
   setG(c.muted || c.audioOff || (rampOn(c) && !c.ramp.audio) ? 0 : c.vol * fullEnv(c, t) * clipTG(c) * duckGain(c, t));
-  if (el.paused) { el.currentTime = st; el.play().catch(() => {}); }
+  if (el.paused) { const k = el._ncKeep; el._ncKeep = null; if (!(k != null && Math.abs(k - st) < .15)) el.currentTime = st; el.play().catch(() => {}); }
   else if (Math.abs(el.currentTime - st) > .3) el.currentTime = st;
+}
+/* players made ready ahead of a cut (playback only):
+   1) a video that is not on screen now but starts within 4 s is taken to its starting point beforehand (paused);
+   2) when the next piece comes from the SAME file at another point (a cut that jumps inside a long video), a second player of
+      that file waits there, and the two change places at the cut.
+   Without this the picture stopped at the cut for as long as the file took to be searched (1 to 2 s in long videos). */
+const PRE = { at: 0, t: 0, next: new Map() };
+function upcoming(t) {
+  const now = performance.now(); if (now - PRE.at < 200 && t >= PRE.t) return PRE.next;
+  PRE.at = now; PRE.t = t; PRE.next = new Map();
+  for (const c of flatClips()) { if (!c.mediaId || c.kind !== 'video' || c.start <= t || c.start > t + 4) continue; const tr = trk(c.track); if (!tr || tr.hide) continue; const p = PRE.next.get(c.mediaId); if (!p || c.start < p.start) PRE.next.set(c.mediaId, c); }
+  return PRE.next;
+}
+function sparePlayer(m) {
+  const url = m.el.currentSrc || m.el.src; let sp = m.spare;
+  if (sp && sp.url !== url) { dropSpare(m); sp = null; }
+  if (sp) return sp;
+  if (playerCount() >= PLAYER_CAP + 2) return null;
+  const el = document.createElement('video'); el.preload = 'auto'; el.playsInline = true; el.src = url; $('#mediaHost').appendChild(el);
+  el.addEventListener('seeked', () => { if (m.el === el) m.seeking = false; requestDraw(); });
+  sp = { el, url, gain: null, fx: null, for: null, st: null };
+  if (actx) { try { const src = actx.createMediaElementSource(el), g = actx.createGain(), out = actx.createGain(); g.gain.value = 0; src.connect(g); sp.fx = buildFx(actx, g, out); out.connect(masterGain); out.connect(recDest); sp.gain = g; } catch {} }
+  return m.spare = sp;
+}
+function dropSpare(m) {
+  const sp = m.spare; if (!sp) return; m.spare = null;
+  try { if (sp.fx && sp.fx.out) sp.fx.out.disconnect(); } catch {} try { if (sp.gain) sp.gain.disconnect(); } catch {}
+  try { sp.el.pause(); sp.el.removeAttribute('src'); sp.el.load(); sp.el.remove(); } catch {}
+}
+function swapSpare(m) {
+  const sp = m.spare, old = { el: m.el, gain: m.gain, fx: m.fx };
+  try { old.el.pause(); } catch {}
+  m.el = sp.el; m.gain = sp.gain; m.fx = sp.fx; m.seeking = false; m.el._ncKeep = sp.st;
+  sp.el = old.el; sp.gain = old.gain; sp.fx = old.fx; sp.for = null; sp.st = null;
+  if (!m.gain) connectMedia(m);
+}
+// c = the clip of this media on screen now (if any), n = how many clips of it are on screen
+function readyAhead(m, c, n, t) {
+  const sp = m.spare;
+  if (c && sp && sp.for === c.id) {   // the cut has arrived: the waiting player takes the place of the main one
+    const st = srcTime(c, t);
+    if (Math.abs(m.el.currentTime - st) > .3 && sp.el.readyState >= 2 && !sp.el.seeking && Math.abs(sp.el.currentTime - st) < .3) swapSpare(m);
+    else if (t > c.start + 1) sp.for = null;
+  }
+  const nx = upcoming(t).get(m.id); if (!nx || nx.start <= t || nx.reverse || rampOn(nx)) return;
+  const want = srcTime(nx, nx.start);
+  if (!c) {   // idle player: wait at the start of its next clip
+    if (m.el.paused && !m.el.seeking && m.el._ncKeep !== want) { m.el._ncKeep = want; if (Math.abs(m.el.currentTime - want) > .04) m.el.currentTime = want; }
+    return;
+  }
+  if (n !== 1 || c === nx || c.start + c.dur > nx.start + .05) return;   // both on screen at once: the extra-copy players take care of that
+  if (Math.abs(want - srcTime(c, nx.start)) < .25) return;                // the file simply goes on: nothing to prepare
+  const s2 = sparePlayer(m); if (!s2) return;
+  if (s2.for !== nx.id || s2.st !== want) { s2.for = nx.id; s2.st = want; try { s2.el.pause(); s2.el.currentTime = want; } catch {} }
 }
 function syncMedia(t, playing) {
   const used = new Set(), by = new Map();
@@ -2042,6 +2099,7 @@ function syncMedia(t, playing) {
   for (const m of Object.values(MEDIA)) {
     if (!m.el || m.kind === 'image' || !m.ready) continue;
     const list = by.get(m.id) || [], c = list[0];
+    if (playing && m.kind === 'video') readyAhead(m, c, list.length, t);
     if (playing && c) playEl(m.el, c, t, m.fx, m.gain, g => setGain(m, g));
     else if (!m.el.paused) m.el.pause();
     for (const x of list.slice(1)) {   // the same media used again at the same moment
@@ -2126,6 +2184,19 @@ const refreshPropsOnSeek = soon(() => { const c = selClip(); if (S.ui.props && c
 
 /* ---------- compound clips (nested timeline): several clips and tracks become one clip, which can be opened and edited ---------- */
 // every clip, including those inside compound clips (to know which media a project uses)
+// neighbours on a track that are apart (or overlapped) only by a rounding error (less than a millionth of a second, as left by
+// "Excluir e Juntar" and other moves made with sums) become exactly joined: the next clip starts where the previous one ends.
+// Without this, a frame of the export or of the preview that falls exactly on the join finds no clip there and comes out black
+function weldSeams(clips) {
+  const by = new Map(); let n = 0;
+  for (const c of clips || []) { let a = by.get(c.track); if (!a) by.set(c.track, a = []); a.push(c); if (c.kind === 'compound' && c.sub) n += weldSeams(c.sub.clips); }
+  for (const a of by.values()) {
+    a.sort((x, y) => x.start - y.start);
+    if (a[0].start !== 0 && Math.abs(a[0].start) < 1e-6) { a[0].start = 0; n++; }
+    for (let i = 1; i < a.length; i++) { const e = a[i - 1].start + a[i - 1].dur, d = a[i].start - e; if (d !== 0 && Math.abs(d) < 1e-6) { a[i].start = e; n++; } }
+  }
+  return n;
+}
 function deepClips(clips) { const out = []; for (const c of clips || []) { out.push(c); if (c.kind === 'compound' && c.sub) out.push(...deepClips(c.sub.clips)); } return out; }
 // the clips of a compound placed on the main timeline (absolute times, cut to the compound's window); ids "compound/inner"
 function virtualSubs(c, depth = 0) {
@@ -2211,6 +2282,7 @@ let INPROJ = null;
 function usedMediaSet() { const s = new Set(), add = cl => deepClips(cl).forEach(c => { if (c.mediaId) { s.add(c.mediaId); s.add(c.mediaId.replace(/~a$/, '')); } }); add(S.clips); (S._stack || []).forEach(st => add(st.clips)); return s; }
 function inProj(id) { if (INPROJ) return S.media.includes(id) || INPROJ.has(id); return S.media.includes(id) || deepClips(S.clips).some(c => c.mediaId === id || c.mediaId === id + '~a') || (S._stack || []).some(st => deepClips(st.clips).some(c => c.mediaId === id || c.mediaId === id + '~a')); }
 function commit(label) {
+  weldSeams(S.clips);
   HIST.list = HIST.list.slice(0, HIST.i + 1); HIST.list.push({ label, s: snap() });
   if (HIST.list.length > 150) HIST.list.shift(); HIST.i = HIST.list.length - 1;
   autosave(); renderAll(); firstVideoCheck(); wakeUsed();
@@ -2234,7 +2306,7 @@ function firstVideoCheck() {
 function restore(i) {
   if (i < 0 || i >= HIST.list.length) return;
   HIST.i = i; const d = JSON.parse(HIST.list[i].s);
-  Object.assign(S, { name: d.name, aspect: d.aspect, res: d.res || ASPECTS[d.aspect] || S.res, fps: d.fps || S.fps, tracks: d.tracks, clips: d.clips, markers: d.markers, range: d.range, subStyle: d.subStyle || null, media: d.mediaList || S.media, duck: d.duck || null, loud: d.loud || '', outLut: d.outLut || '' }); FPS = S.fps; S._hadVid = hasVideoClip();
+  Object.assign(S, { name: d.name, aspect: d.aspect, res: d.res || ASPECTS[d.aspect] || S.res, fps: d.fps || S.fps, tracks: d.tracks, clips: d.clips, markers: d.markers, range: d.range, subStyle: d.subStyle || null, media: d.mediaList || S.media, duck: d.duck || null, loud: d.loud || '', outLut: d.outLut || '' }); FPS = S.fps; S._hadVid = hasVideoClip(); weldSeams(S.clips);
   S.sel = S.sel.filter(id => S.clips.some(c => c.id === id));
   autosave(); renderAll(); wakeUsed();
 }
@@ -2250,6 +2322,7 @@ function loadProject(d) {
   Object.entries(d.media || {}).forEach(([id, m]) => { if (!MEDIA[id]) MEDIA[id] = { id, name: m.name, kind: m.kind, cat: m.cat || 'project', duration: m.duration, offline: true, srcPath: m.path, size: m.size, fp: m.fp, hash: m.hash, duration: m.duration, w: m.w, h: m.h }; else { if (m.path && !MEDIA[id].srcPath) MEDIA[id].srcPath = m.path; if (m.hash && !MEDIA[id].hash) MEDIA[id].hash = m.hash; } });
   setTimeout(() => relinkFromPaths(), 600);
   deepClips(S.clips).forEach(c => { ensureClipDefaults(c); if (c.mediaId && c.mediaId.endsWith('~a')) ensureDerived(c.mediaId.slice(0, -2)); });
+  weldSeams(S.clips);
   compoundBar(); wakeUsed();
 }
 
@@ -3586,7 +3659,7 @@ async function openRecorder(mode, placeAt) {
 }
 
 /* ---------- preferences ---------- */
-const APP_VERSION = '3.0.4';   // must match electron/app/package.json (the installer build checks it)
+const APP_VERSION = '3.0.5';   // must match electron/app/package.json (the installer build checks it)
 const PREFS = Object.assign({ openLast: true, previewQ: 1, imgDur: 5, titleDur: 4, transDur: .8, freezeDur: 3, askRes: true, autoJoin: true, resChoice: 'project', autosave: true, keepVersions: 20, gpu: 'auto', hwRender: true, hwDecode: true, proxy: true, autoProxy: true, memWarn: true, autoRes: true, saveCaptures: true, copyMedia: false },
   (() => { try { return JSON.parse(localStorage.getItem('novacut.prefs') || '{}'); } catch { return {}; } })());
 function savePrefs() { try { localStorage.setItem('novacut.prefs', JSON.stringify(PREFS)); } catch {} }
@@ -3743,13 +3816,15 @@ function captureSave(opts) {
   return { pid: S.pid, seq: saveSeq(), opts, snap: snapNow, name: S.name, res: projRes(), fps: S.fps, t: S.t, file: FILE_HANDLE || null, thumbP: smallThumb().catch(() => '') };
 }
 async function writeSave(job) {
-  const rec = (await IDB.proj.get(job.pid)) || { id: job.pid, created: Date.now(), versions: [] };
+  // strict read and write: if the database fails here the save is reported as failed (before, the error was hidden and the
+  // program said "Salvo"; a failed read also made a new empty record, losing the saved versions)
+  const rec = (await IDB.proj.getStrict(job.pid)) || { id: job.pid, created: Date.now(), versions: [] };
   if (rec.wseq && rec.wseq > job.seq) { hlog('salvamento mais antigo ignorado (já existe um mais novo)'); return rec; }
   // the save before this one stays as a spare copy (used by the recovery if the newest cannot be opened)
   if (rec.data && rec.data !== job.snap.data) rec.prev = { t: rec.modified || Date.now(), data: rec.data };
   Object.assign(rec, { name: job.name, modified: Date.now(), wseq: job.seq, data: job.snap.data, dur: job.snap.dur, res: job.res, fps: job.fps, edits: job.snap.hist.list.length, hist: job.snap.hist, open: job.snap.open, openT: job.t, file: job.file, fileName: job.file ? job.file.name : '' });
   if (job.opts.version) rec.versions = [{ t: Date.now(), label: job.opts.version, data: rec.data }, ...(rec.versions || [])].slice(0, PREFS.keepVersions);
-  await IDB.proj.put(rec);
+  await IDB.proj.putStrict(rec);
   try { localStorage.setItem('novacut.lastpid', job.pid); } catch {}
   refreshRecent();
   // the thumbnail follows, only if no newer save has been written meanwhile
@@ -3918,9 +3993,21 @@ function openProjectRecord(rec) {
   if (rec.open && rec.open.length) { for (const id of rec.open) { const c = S.clips.find(x => x.id === id && x.kind === 'compound'); if (!c) break; openCompound(c); } if (S._stack && S._stack.length && rec.openT != null) { S.t = rec.openT; requestDraw(); placePlayhead(); } }
   try { localStorage.setItem('novacut.lastpid', S.pid); } catch {}
 }
-async function openRecent(id) { if (id === S.pid) return; await saveProjectRecord(); const rec = await IDB.proj.get(id); if (rec) { openProjectRecord(rec); toast('Projeto aberto: ' + rec.name); } }
+// leaving the open project (new, open another, import, restore a version): only after it was really saved. If the save fails,
+// the project stays open and you choose: stay (the default) or go on without saving
+async function leaveOk() {
+  const r = await saveProjectRecord(); if (r) return true;
+  return new Promise(res => {
+    let done = false; const end = v => { if (!done) { done = true; res(v); } };
+    const d = openModal('O projeto atual não foi salvo', `<p style="margin:0;font-weight:700">O NovaCut não conseguiu salvar "${esc(S.name)}".</p>
+      <p class="hint">Por segurança, ele continua aberto e nada foi trocado. Use <b>Arquivo › Salvar como</b> para guardar uma cópia numa pasta e tente de novo. Se preferir continuar mesmo assim, as mudanças feitas depois do último salvamento bom serão perdidas.</p>`,
+      [{ l: 'Continuar sem salvar', a: () => end(true) }, { l: 'Ficar neste projeto', pri: true, a: () => end(false) }]);
+    d._close = () => end(false);
+  });
+}
+async function openRecent(id) { if (id === S.pid) return; if (!(await leaveOk())) return; const rec = await IDB.proj.get(id); if (rec) { openProjectRecord(rec); toast('Projeto aberto: ' + rec.name); } }
 async function newProjectWith(a, skipSave) {
-  if (!skipSave) await saveProjectRecord();
+  if (!skipSave && !(await leaveOk())) return;
   pause(); S.pid = uid(); FILE_HANDLE = null;
   Object.assign(S, { name: 'Sem Título', aspect: a, res: defaultRes(a, [1920, 1080]), tracks: defaultTracks(), clips: [], markers: [], range: null, sel: [], t: 0, subStyle: null, media: [], duck: null, loud: '', _hadVid: false, _stack: [] }); S.gap = null; S.ui.cat.media = 'project';
   S.ui.props = false; HIST.list = [{ label: 'Novo projeto ' + a, s: snap() }]; HIST.i = 0;
@@ -3932,7 +4019,9 @@ async function saveNow() {
   if (!FILE_HANDLE && canPickFiles()) { const rec = await IDB.proj.get(S.pid); if (!rec || !rec.askedLoc) { if (rec) { rec.askedLoc = true; await IDB.proj.put(rec); } return saveAs(true); } }
   let msg = '';
   if (FILE_HANDLE) { try { await writeHandle(FILE_HANDLE, projectJSON()); msg = ' em ' + FILE_HANDLE.name; } catch { msg = ' (não foi possível gravar ' + FILE_HANDLE.name + ')'; } }
-  const r = await saveProjectRecord({ version: 'Salvo manualmente' }); toast('Projeto salvo' + msg + ' · ' + r.versions.length + ' versão(ões) no histórico');
+  const r = await saveProjectRecord({ version: 'Salvo manualmente' });
+  if (!r) return toast('O projeto NÃO foi salvo na biblioteca do NovaCut' + (msg && !/não foi/.test(msg) ? ' (o arquivo' + msg + ' foi gravado)' : '') + '. Use Arquivo › Salvar como para guardar uma cópia numa pasta.');
+  toast('Projeto salvo' + msg + ' · ' + r.versions.length + ' versão(ões) no histórico');
 }
 function saveAs(first) {
   const pick = canPickFiles();
@@ -3951,9 +4040,9 @@ function saveAs(first) {
         if (!first) S.pid = uid();
         S.name = h ? h.name.replace(/\.ncproj$/i, '') : n; FILE_HANDLE = h; commit(first ? 'Salvar projeto' : 'Salvar como ' + S.name);
         if (h) { try { await writeHandle(h, projectJSON()); await IDB.proj.put({ id: '__lastdir', handle: h, modified: 0 }); } catch { toast('Não foi possível gravar o arquivo'); } }
-        const r = await saveProjectRecord({ version: first ? 'Salvo manualmente' : 'Criado com Salvar Como' }); r.askedLoc = true; await IDB.proj.put(r);
+        const r = await saveProjectRecord({ version: first ? 'Salvo manualmente' : 'Criado com Salvar Como' }); if (r) { r.askedLoc = true; await IDB.proj.put(r); }
         if (dl) saveProjectFile();
-        toast(h ? 'Projeto salvo em ' + h.name : 'Projeto salvo como "' + S.name + '"');
+        toast(r ? (h ? 'Projeto salvo em ' + h.name : 'Projeto salvo como "' + S.name + '"') : h ? 'Arquivo gravado em ' + h.name + ', mas a biblioteca do NovaCut não pôde ser atualizada' : 'Não foi possível salvar o projeto na biblioteca do NovaCut');
       })();
     } }]);
 }
@@ -3968,7 +4057,7 @@ async function openProjects() {
     if (act === 'new') { closeModal(); return newProjectWith(S.aspect); }
     if (act === 'file') return openFromDisk();
     const rec = await IDB.proj.get(id); if (!rec) return;
-    if (act === 'open') { closeModal(); if (id !== S.pid) { await saveProjectRecord(); openProjectRecord(rec); toast('Projeto aberto: ' + rec.name); } }
+    if (act === 'open') { closeModal(); if (id !== S.pid) { if (!(await leaveOk())) return; openProjectRecord(rec); toast('Projeto aberto: ' + rec.name); } }
     else if (act === 'hist') openProjectHistory(id);
     else if (act === 'ren') openModal('Renomear projeto', `<input id="rnIn" type="text" value="${esc(rec.name)}" aria-label="Nome">`, [{ l: 'Voltar', a: () => { openProjects(); return false; } }, { l: 'Renomear', pri: true, a: () => { const v = $('#rnIn').value.trim() || rec.name; (async () => { if (id === S.pid) { S.name = v; commit('Renomear projeto'); await saveProjectRecord(); } else { const dd = JSON.parse(rec.data); dd.name = v; rec.data = JSON.stringify(dd); rec.name = v; await IDB.proj.put(rec); } openProjects(); })(); return false; } }]);
     else if (act === 'dup') { const dd = JSON.parse(rec.data); dd.name = rec.name + ' (cópia)'; await IDB.proj.put({ ...rec, id: uid(), name: dd.name, data: JSON.stringify(dd), created: Date.now(), modified: Date.now() }); openProjects(); }
@@ -3986,7 +4075,7 @@ async function openProjectHistory(id) {
     [{ l: 'Voltar', a: () => { openProjects(); return false; } }, { l: 'Fechar' }], true);
   d.querySelector('.mbody').onclick = async e => {
     const hv = e.target.closest('[data-hv]'), hs = e.target.closest('[data-hs]'); if (!hv && !hs) return;
-    await saveProjectRecord(); const fresh = await IDB.proj.get(id); closeModal(); openProjectRecord(fresh);
+    if (!(await leaveOk())) return; const fresh = await IDB.proj.get(id); if (!fresh) return toast('Não foi possível ler o projeto salvo'); closeModal(); openProjectRecord(fresh);
     if (hv) { const v = fresh.versions[+hv.dataset.hv]; loadProject(JSON.parse(v.data)); S.pid = fresh.id; commit('Restaurar versão de ' + fmtD(v.t)); toast('Versão restaurada'); }
     else { restore(+hs.dataset.hs); toast('Projeto aberto no passo ' + (+hs.dataset.hs + 1)); }
   };
@@ -4120,7 +4209,7 @@ async function openProjectFile(file, handle) {
     }
     else d = JSON.parse(await file.text());
     if (d.app !== 'NovaCut' || d.v !== 2) throw 0;
-    await saveProjectRecord();
+    if (!(await leaveOk())) return;
     for (const [id, blob] of Object.entries(media)) { if (MEDIA[id] && !MEDIA[id].offline) continue; const info = (d.media || {})[id] || {}; const m = MEDIA[id] || { id }; Object.assign(m, { name: info.name || id, kind: info.kind || 'video', cat: 'project' }); await registerMedia(m, blob, true); }
     loadProject(d); S.pid = uid(); FILE_HANDLE = handle && /\.(ncproj|json)$/i.test(file.name) ? handle : null; HIST.list = [{ label: 'Aberto de ' + file.name, s: snap() }]; HIST.i = 0; S.ui.props = false; renderAll(); setVZoom(S.ui.vz || 'fit');
     await saveProjectRecord({ version: 'Importado de ' + file.name }); toast('Projeto aberto: ' + S.name);
@@ -4627,7 +4716,7 @@ async function waitProjectMedia(ms = 30000) {
   while (Date.now() - t0 < ms) { const ids = [...new Set(deepClips(S.clips).filter(c => c.mediaId && c.kind === 'video').map(c => c.mediaId))]; if (ids.every(id => { const m = MEDIA[id]; return !m || m.offline || m.ready; })) return; await sleep(250); }
 }
 async function runQueue() {
-  const back = S.pid, ES0 = clone(ES); await saveProjectRecord();
+  const back = S.pid, ES0 = clone(ES); if (!(await leaveOk())) return;
   let ok = 0, fail = 0, stopped = false;
   while (EXPQ.length) {
     const q = EXPQ[0];
@@ -4646,7 +4735,7 @@ async function runQueue() {
   openModal('Fila de exportação', `<p class="hint">${stopped ? 'Fila interrompida. ' : 'Fila concluída. '}${ok} arquivo(s) exportado(s)${fail ? `, ${fail} com problema` : ''}. ${EXPQ.length ? EXPQ.length + ' item(ns) continuam na fila.' : ''} Os arquivos estão na pasta ${esc(expDirName())}.</p>`, [{ l: 'Fechar', pri: true }]);
 }
 async function exportVideo(from, to, finish) {
-  ensureAudio();
+  ensureAudio(); weldSeams(S.clips);
   const C = CONTAINERS[ES.fmt], co = codecOpts(ES.fmt), vc = (co.v.find(x => x[1] === ES.vcodec) || co.v[0])[1], ac = (co.a.find(x => x[1] === ES.acodec) || co.a[0])[1];
   const mime = `${C.mime};codecs=${vc},${ac}`, [W] = projRes(), [ow] = expRes();
   if (recDest) { try { recDest.channelCount = ES.ch; recDest.channelCountMode = 'explicit'; } catch {} }
@@ -4728,6 +4817,7 @@ function gifEncode(frames, w, h, delay) {
 // Each frame is compressed as soon as it is drawn (only the compressed GIF stays in memory), and very long GIFs are refused.
 const GIF_MAX_FRAMES = 3000;
 async function exportGif(from, to, finish) {
+  weldSeams(S.clips);
   const keep = { q: S.quality, t: S.t }; let blob = null, err = null;
   const [W0, H0] = projRes(), n0 = Math.max(1, Math.ceil((to - from) * ES.gifFps));
   if (n0 > GIF_MAX_FRAMES) { $('#modal').hidden = true; return toast(`GIF longo demais: ${n0} quadros (máximo ${GIF_MAX_FRAMES}). Diminua o trecho ou os quadros por segundo, ou exporte em MP4.`); }
@@ -4850,32 +4940,76 @@ async function packetRange(ix, a, b) {
   while (lo < hi) { const mid = (lo + hi) >> 1; if (S0[mid].t + S0[mid].dur <= a) lo = mid + 1; else hi = mid; }
   const i0 = Math.max(0, lo - 3); let i1 = lo; while (i1 < S0.length && S0[i1].t < b) i1++; i1 = Math.min(S0.length, i1 + 1);
   if (i1 <= i0) return null;
-  // the packets of the range, read from disk in blocks of up to 16 MB
-  const data = new Array(i1 - i0);
-  for (let i = i0; i < i1;) { let l = S0[i].off, h = l + S0[i].size, j = i + 1; while (j < i1 && Math.max(h, S0[j].off + S0[j].size) - Math.min(l, S0[j].off) < 16e6) { l = Math.min(l, S0[j].off); h = Math.max(h, S0[j].off + S0[j].size); j++; } const buf = await ix.blob.slice(l, h).arrayBuffer(); for (let k = i; k < j; k++) data[k - i0] = new Uint8Array(buf, S0[k].off - l, S0[k].size); i = j; }
-  const frames = []; let err = null;
-  const dec = new AudioDecoder({ output: f => frames.push(f), error: e => err = e }); dec.configure(ix.config);
-  for (let i = i0; i < i1; i++) dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(S0[i].t * 1e6), duration: Math.max(1, Math.round(S0[i].dur * 1e6)), data: data[i - i0] }));
-  await dec.flush(); try { dec.close(); } catch {}
-  if (err || !frames.length) { frames.forEach(f => f.close()); if (err) throw err; return null; }
+  // the packets of the range, read from disk in blocks of up to 16 MB (a packet the file does not hold any more is left out)
+  const data = new Array(i1 - i0); let missing = 0;
+  for (let i = i0; i < i1;) {
+    let l = S0[i].off, h = l + S0[i].size, j = i + 1; while (j < i1 && Math.max(h, S0[j].off + S0[j].size) - Math.min(l, S0[j].off) < 16e6) { l = Math.min(l, S0[j].off); h = Math.max(h, S0[j].off + S0[j].size); j++; }
+    const buf = await ix.blob.slice(l, h).arrayBuffer();
+    for (let k = i; k < j; k++) { const o = S0[k].off - l; if (o >= 0 && o + S0[k].size <= buf.byteLength) data[k - i0] = new Uint8Array(buf, o, S0[k].size); else missing++; }
+    i = j;
+  }
+  // packets p0..p1-1 through one decoder; a decoder error ends the run (what was decoded before it is kept)
+  const run = async (p0, p1) => {
+    const frames = []; let err = null;
+    const dec = new AudioDecoder({ output: f => frames.push(f), error: e => err = e });
+    try {
+      dec.configure(ix.config);
+      for (let i = p0; i < p1 && dec.state === 'configured'; i++) { const d = data[i - i0]; if (d) dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(S0[i].t * 1e6), duration: Math.max(1, Math.round(S0[i].dur * 1e6) || 1), data: d })); }
+      if (dec.state === 'configured') await dec.flush();
+    } catch (e) { err = err || e; }
+    try { dec.close(); } catch {}
+    return { frames, err };
+  };
+  let { frames, err } = await run(i0, i1), bad = missing ? 1 : 0;
+  if (err) {
+    // a bad packet stops the decoder: the range is decoded again in small groups, so only the group with the bad packet stays silent
+    frames.forEach(f => f.close()); frames = []; bad = 0;
+    for (let p = i0; p < i1; p += 40) { const r = await run(Math.max(i0, p - 2), Math.min(i1, p + 40)); if (r.err) bad++; frames.push(...r.frames); }
+    if (!frames.length) throw err;
+  }
+  if (!frames.length) return null;
   frames.sort((x, y) => x.timestamp - y.timestamp);
   const sr = frames[0].sampleRate, ch = frames[0].numberOfChannels, t0 = frames[0].timestamp / 1e6, last = frames[frames.length - 1];
   const len = Math.max(1, Math.round((last.timestamp / 1e6 - t0) * sr) + last.numberOfFrames), buf = new AudioBuffer({ length: len, numberOfChannels: ch, sampleRate: sr });
   for (const f of frames) {
     const at = Math.round((f.timestamp / 1e6 - t0) * sr), n = Math.min(f.numberOfFrames, len - at);
-    if (n > 0 && at >= 0) for (let c = 0; c < ch; c++) { const x = new Float32Array(f.numberOfFrames); f.copyTo(x, { planeIndex: c, format: 'f32-planar' }); buf.copyToChannel(x.subarray(0, n), c, at); }
+    try { if (n > 0 && at >= 0 && f.numberOfChannels >= ch) for (let c = 0; c < ch; c++) { const x = new Float32Array(f.numberOfFrames); f.copyTo(x, { planeIndex: c, format: 'f32-planar' }); buf.copyToChannel(x.subarray(0, n), c, at); } } catch {}
     f.close();
   }
-  return { buf, t0 };
+  return { buf, t0, bad };
+}
+// a file on disk that changed size since it was imported (still being copied or downloaded then, or replaced by another of the
+// same name): the reader is renewed with the size it has now, and its sound index is made again
+async function refreshDisk(m) {
+  const base = (m.parent && MEDIA[m.parent]) || m, bl = base.blob, fs = HOSTFS(); if (!(bl instanceof DiskFile) || !fs || !fs.stat) return false;
+  try {
+    const st = (await fs.stat([bl.path]))[0]; if (!st || !st.exists || st.size === bl.full) return false;
+    hlog(`arquivo mudou de tamanho no disco (${base.name}): ${bl.full} → ${st.size}`);
+    base.blob = new DiskFile(bl.path, st.size, bl.name, bl.type); base.size = st.size; blobFp(base.blob).then(f => { base.fp = f; }).catch(() => {});
+    AIDX.delete(base.id); return true;
+  } catch { return false; }
+}
+// before an export: every file of the project is checked once (one question to the disk for all of them)
+async function refreshUsedDisk() {
+  const fs = HOSTFS(); if (!fs || !fs.stat) return 0;
+  const ms = [...new Set(flatClips().map(c => c.mediaId && MEDIA[String(c.mediaId).replace(/~a$/, '')]).filter(m => m && m.blob instanceof DiskFile))]; if (!ms.length) return 0;
+  let n = 0;
+  try { const st = await fs.stat(ms.map(m => m.blob.path)); for (let i = 0; i < ms.length; i++) { const m = ms[i], x = st[i]; if (x && x.exists && x.size !== m.blob.full) { hlog(`arquivo mudou de tamanho no disco (${m.name}): ${m.blob.full} → ${x.size}`); m.blob = new DiskFile(m.blob.path, x.size, m.blob.name, m.blob.type); m.size = x.size; blobFp(m.blob).then(f => { m.fp = f; }).catch(() => {}); AIDX.delete(m.id); n++; } } } catch {}
+  return n;
 }
 // the sound of a media between source times a and b: { buf, t0 = source time of the buffer's first sample }
-async function audioRange(m, a, b, sr) {
+async function audioRange(m, a, b, sr, again) {
   a = Math.max(0, a); const ix = await audioIndex(m);
   if (ix && ix.kind === 'none') return null;   // a video without sound
+  let part = null, failed = null;
   try {
     if (ix && ix.kind === 'wav') return await wavRange(ix, a, b);
-    if (ix && ix.kind === 'packets') { const r = await packetRange(ix, a, b); if (r) return r; }
-  } catch (e) { hlog('leitura de áudio por trecho (' + m.name + '): ' + (e && e.message) + ' · lendo o arquivo inteiro'); }
+    if (ix && ix.kind === 'packets') { const r = await packetRange(ix, a, b); if (!r) return null; /* nothing there (past the end of the sound): silence */ if (!r.bad) return r; part = r; }
+  } catch (e) { failed = e; hlog('leitura de áudio por trecho (' + m.name + ', ' + a.toFixed(1) + '–' + b.toFixed(1) + ' s): ' + (e && e.message)); }
+  if ((part || failed) && !again && await refreshDisk(m)) return audioRange(m, a, b, sr, true);
+  if (part) { audioWarn(m, null, true); return part; }
+  // a long file is never decoded whole in memory (a 30-minute video would take more than 1 GB each time): that part stays silent
+  if (ix && ix.kind === 'packets') { const bl = mediaBlob(m); if (!bl || bl.size > 150e6) { audioWarn(m, failed, true); return null; } }
   // other formats (MP3, OGG, FLAC…): the whole file decoded once, kept in the limited cache
   const key = (m.parent || m.id) + '@' + sr; let buf = decGet(key);
   if (!buf) {
@@ -4887,10 +5021,11 @@ async function audioRange(m, a, b, sr) {
 }
 // a sound that could not be read is reported once (the export would otherwise come out silent without a word)
 const AUDIO_WARNED = new Set();
-function audioWarn(m, e) {
-  const id = m.parent || m.id; hlog('áudio ilegível (' + m.name + '): ' + (e && e.message));
-  if (AUDIO_WARNED.has(id)) return; AUDIO_WARNED.add(id);
-  toast(`O som de "${(MEDIA[id] || m).name}" não pôde ser lido (formato de áudio não suportado). Esse clipe fica sem som na mixagem e na exportação.`);
+function audioWarn(m, e, part) {
+  const id = m.parent || m.id; if (AUDIO_WARNED.has(id + (part ? '#p' : ''))) return; AUDIO_WARNED.add(id + (part ? '#p' : ''));
+  hlog((part ? 'áudio com trecho ilegível (' : 'áudio ilegível (') + m.name + ')' + (e && e.message ? ': ' + e.message : ''));
+  toast(part ? `Um trecho do som de "${(MEDIA[id] || m).name}" não pôde ser lido (o arquivo pode estar incompleto ou danificado). Esse trecho fica em silêncio.`
+    : `O som de "${(MEDIA[id] || m).name}" não pôde ser lido (formato de áudio não suportado). Esse clipe fica sem som na mixagem e na exportação.`);
 }
 // mixes [from, to) into one buffer of len samples (one block of the engine below)
 async function mixAudio(from, to, sr, ch, len) {
@@ -5520,7 +5655,7 @@ async function importWfp(file) {
     const tag = +p['clip_color_infotag']; if (tag > 0) c.mark = (tag - 1) % 8;
     clips.push(c);
   }
-  await saveProjectRecord(); pause();
+  if (!(await leaveOk())) return; pause();
   S.pid = uid(); FILE_HANDLE = null;
   Object.assign(S, { name: info.document_name || file.name.replace(/\.wfp$/i, ''), aspect: ratioLabel(rw, rh), res: [even(rw), even(rh)], fps, tracks, clips, markers: [], range: null, sel: [], t: 0, subStyle: null, media: Object.values(byPath).map(m => m.id) }); FPS = fps;
   HIST.list = [{ label: 'Importado do Filmora: ' + file.name, s: snap() }]; HIST.i = 0; S.ui.props = false; renderAll(); setVZoom(S.ui.vz || 'fit');
@@ -5816,46 +5951,68 @@ async function demuxMkv(blob, audio) {
   const out = normSamples(samples);
   return { config, samples: out, load: lazyLoader(blob, out), lazy: true, ...aInfo };
 }
+// a compressed frame for the decoder (a frame time or length that is not a whole positive number is fixed here, never an exception)
+function videoChunk(s) { return new EncodedVideoChunk({ type: s.key ? 'key' : 'delta', timestamp: Math.max(0, Math.round(s.cts) || 0), duration: Math.max(0, Math.round(s.dur) || 0), data: s.data }); }
+// reads the frames of a video in order, for the export. Flow control: only a limited number of frames is inside the decoder at a time
+// (fed minus given back), so a slow moment never makes the reader pour the rest of the file into the decoder
 class WCReader {
-  constructor(dm) { this.dm = dm; this.dec = null; this.q = []; this.cur = null; this.next = 0; this.flushed = false; this.err = null; this.w = []; this.lastFed = -1; this.target = 0; }
+  constructor(dm) {
+    this.dm = dm; this.dec = null; this.q = []; this.cur = null; this.next = 0; this.flushed = false; this.flushDone = false; this.err = null; this.w = []; this.lastFed = -1; this.target = 0; this.fed = 0; this.out = 0;
+    const px = Math.max(1, (dm.config.codedWidth || 1920) * (dm.config.codedHeight || 1080));
+    this.cap = clamp(Math.floor(120e6 / (px * 1.5)), 12, 32);   // frames allowed inside the decoder (raised by itself when a decoder needs more to start giving frames)
+  }
   wake() { const w = this.w; this.w = []; w.forEach(r => r()); }
-  wait(ms = 4000) { return new Promise((res, rej) => { const to = setTimeout(() => { this.w = this.w.filter(x => x !== go); rej(new Error('stall')); }, ms); const go = () => { clearTimeout(to); res(); }; this.w.push(go); }); }
+  // waits for the decoder (a frame, the end of the stream); ends by itself after ms
+  wait(ms = 250) { return new Promise(res => { const go = () => { clearTimeout(to); res(); }, to = setTimeout(() => { this.w = this.w.filter(x => x !== go); res(); }, ms); this.w.push(go); }); }
+  keyIndex(us) { const S2 = this.dm.samples; let k = 0; for (let i = 0; i < S2.length; i++) { if (S2[i].key && S2[i].cts <= us + 1000) k = i; if (S2[i].dts > us + 1000 && S2[i].key) break; } return k; }
   reset(us) {
     this.q.forEach(f => f.close()); this.q = []; if (this.cur) { this.cur.close(); this.cur = null; }
-    if (this.dec && this.dec.state !== 'closed') { try { this.dec.reset(); } catch { try { this.dec.close(); } catch {} this.dec = null; } } else this.dec = null;
+    if (this.dec && this.dec.state !== 'closed' && !this.err) { try { this.dec.reset(); } catch { try { this.dec.close(); } catch {} this.dec = null; } } else { try { this.dec && this.dec.close(); } catch {} this.dec = null; }
     // frames already behind the requested time are released right away: a GPU decoder has few frame buffers and stops (or never finishes a flush) while they are held
-    if (!this.dec) { this.dec = new VideoDecoder({ output: f => { const q = this.q; q.push(f); if (q.length > 1) q.sort((a, b) => a.timestamp - b.timestamp); while (q.length > 1 && q[1].timestamp <= this.target + 500) q.shift().close(); this.wake(); }, error: e => { this.err = e; this.wake(); } }); this.dec.ondequeue = () => this.wake(); }
+    if (!this.dec) { const me = this, dec = new VideoDecoder({ output: f => { if (me.dec !== dec) { f.close(); return; } me.out++; const q = me.q; q.push(f); if (q.length > 1) q.sort((a, b) => a.timestamp - b.timestamp); while (q.length > 1 && q[1].timestamp <= me.target + 500) q.shift().close(); me.wake(); }, error: e => { if (me.dec === dec) { me.err = e; me.wake(); } } }); this.dec = dec; this.err = null; }
     this.dec.configure(this.dm.config);
-    const S2 = this.dm.samples; let k = 0; for (let i = 0; i < S2.length; i++) { if (S2[i].key && S2[i].cts <= us + 1000) k = i; if (S2[i].dts > us + 1000 && S2[i].key) break; }
-    this.next = k; this.flushed = false; this.lastFed = -1;
+    this.next = this.keyIndex(us); this.flushed = false; this.flushDone = false; this.lastFed = -1; this.fed = 0; this.out = 0;
   }
   async frameAt(t) {
     const us = t * 1e6, S2 = this.dm.samples; this.target = us;
-    // restart only to go back, or to jump far ahead; past the last frame (all fed) it just keeps showing the last one
-    if (!this.dec || (this.cur && us < this.cur.timestamp - 1000) || (!this.flushed && this.lastFed >= 0 && us > this.lastFed + 2.5e6 && !this.q.some(f => f.timestamp > us))) this.reset(us);
-    for (let guard = 0; guard < 1e6; guard++) {
+    // restart only to go back, or to jump ahead past a key frame; past the last frame (all fed) it just keeps showing the last one
+    if (!this.dec || this.err || (this.cur && us < this.cur.timestamp - 1000)) this.reset(us);
+    else if (!this.flushed && this.lastFed >= 0 && us > this.lastFed + 2.5e6 && !this.q.some(f => f.timestamp > us) && this.keyIndex(us) > this.next) this.reset(us);
+    let idle = 0;
+    for (;;) {
       if (this.err) throw this.err;
       if (this.q.length > 1) this.q.sort((a, b) => a.timestamp - b.timestamp);
       while (this.q.length && this.q[0].timestamp <= us + 500) { if (this.cur) this.cur.close(); this.cur = this.q.shift(); }
       if (this.q.length) return this.cur || this.q[0];
-      if (this.next < S2.length) {
-        if (!S2[this.next].data && this.dm.load) await this.dm.load(this.next, this.next + 90);   /* frames come from disk in blocks */
+      if (this.flushDone) return this.cur || null;
+      if (this.next < S2.length && this.fed - this.out < this.cap) {
+        if (!S2[this.next].data && this.dm.load) { await this.dm.load(this.next, this.next + 90); if (!this.dec || this.err) continue; }   /* frames come from disk in blocks */
         const s = S2[this.next++];
-        this.dec.decode(new EncodedVideoChunk({ type: s.key ? 'key' : 'delta', timestamp: Math.round(s.cts), duration: Math.round(s.dur), data: s.data }));
+        if (!s.data || !s.data.byteLength) { const e = new Error('quadro ' + (this.next - 1) + ' não pôde ser lido do arquivo (arquivo incompleto ou alterado)'); e.badFile = true; throw e; }
+        this.dec.decode(videoChunk(s)); this.fed++;
         if (this.dm.lazy) s.data = null;
         this.lastFed = Math.max(this.lastFed, s.cts);
-        if (this.dec.decodeQueueSize > 3) await this.wait();
-      } else if (!this.flushed) { this.flushed = true; await Promise.race([this.dec.flush().catch(() => {}), new Promise((_, rej) => setTimeout(() => rej(new Error('stall')), 6000))]); }
-      else return this.cur || null;
-      if (this.next % 4 === 0) await Promise.resolve();
+        continue;
+      }
+      if (this.next >= S2.length && !this.flushed) { this.flushed = true; const d = this.dec, done = () => { if (this.dec === d) { this.flushDone = true; this.wake(); } }; d.flush().then(done, done); continue; }
+      // the decoder has its share: wait for a frame. Some decoders hold frames until they get more input, so the share grows after a short silence
+      const t0 = performance.now(), o0 = this.out; await this.wait(250);
+      if (this.out !== o0 || this.flushDone) { idle = 0; continue; }
+      idle += performance.now() - t0;
+      if (idle >= 150 && this.next < S2.length && this.cap < 160) this.cap += 16;
+      else if (idle >= 20000) throw new Error('stall');
     }
-    return this.cur;
   }
-  close() { try { this.dec && this.dec.close(); } catch {} this.q.forEach(f => f.close()); this.q = []; if (this.cur) this.cur.close(); this.cur = null; }
+  close() { const d = this.dec; this.dec = null; try { d && d.close(); } catch {} this.q.forEach(f => f.close()); this.q = []; if (this.cur) this.cur.close(); this.cur = null; this.wake(); }
 }
+// slow reader of last resort (a player moved frame by frame); gives nothing when the player has no picture, never an old or empty one
 class SeekReader {
   constructor(m) { this.v = document.createElement('video'); this.v.muted = true; this.v.preload = 'auto'; this.v.src = m.url; $('#mediaHost').appendChild(this.v); this.ready = once(this.v, 'loadeddata', 10000); }
-  async frameAt(t) { await this.ready; if (Math.abs(this.v.currentTime - t) > 1e-4) { this.v.currentTime = t; await once(this.v, 'seeked', 5000); } return this.v; }
+  async frameAt(t) {
+    await this.ready; const v = this.v, d = isFinite(v.duration) ? v.duration : 0; if (d) t = Math.min(t, Math.max(0, d - .02));
+    if (Math.abs(v.currentTime - t) > 1e-4) { v.currentTime = t; await once(v, 'seeked', 5000); }
+    return v.readyState >= 2 && v.videoWidth ? v : null;
+  }
   close() { this.v.removeAttribute('src'); this.v.load(); this.v.remove(); }
 }
 /* ---------- proxies: a light copy (960 px) of heavy videos for smooth editing; export always reads the original ---------- */
@@ -5886,13 +6043,14 @@ async function makeProxy(m, quiet) {
     const enc = new VideoEncoder({ output: (c, meta) => { pushAudio(c.timestamp); muxer.addVideoChunk(c, meta); }, error: e => err = e }); enc.configure(vcfg);
     const dec = new VideoDecoder({ output: f => { g.drawImage(f, 0, 0, PW, PH); const vf = new VideoFrame(k, { timestamp: f.timestamp, duration: f.duration || undefined }); enc.encode(vf, { keyFrame: n++ % (fps * 2) === 0 }); vf.close(); f.close(); }, error: e => err = e });
     dec.configure(d.config);
-    let lastTick = 0;
+    let lastTick = 0, fedN = 0;
     for (let i = 0; i < S2.length; i++) {
       if (err) throw err;
       while (EXP.busy) await sleep(500);   // never competes with an export
       if (!S2[i].data && d.load) await d.load(i, i + 90);
-      const s = S2[i]; dec.decode(new EncodedVideoChunk({ type: s.key ? 'key' : 'delta', timestamp: Math.round(s.cts), duration: Math.round(s.dur), data: s.data })); if (d.lazy) s.data = null;
-      while (dec.decodeQueueSize > 6 || enc.encodeQueueSize > 6) await sleep(2);
+      const s = S2[i]; dec.decode(videoChunk(s)); fedN++; if (d.lazy) s.data = null;
+      // at most 24 frames inside the decoder at a time (a short silence lets more in: some decoders need more input before giving frames)
+      for (let w = 0; (fedN - n > 24 && w < 150) || dec.decodeQueueSize > 6 || enc.encodeQueueSize > 6; w++) await sleep(2);
       if (!quiet && performance.now() - lastTick > 4000) { lastTick = performance.now(); toast(`Criando cópia leve de ${m.name}: ${Math.round(i / S2.length * 100)}%`); }
     }
     await dec.flush(); dec.close(); await enc.flush(); enc.close(); if (err) throw err;
@@ -6224,7 +6382,7 @@ async function makeReversed(m, onProg) {
     }, error: e => err = e });
     dec.configure(d.config);
     if (d.load) await d.load(a, b);
-    for (let i = a; i < b; i++) { const s = S2[i]; dec.decode(new EncodedVideoChunk({ type: s.key ? 'key' : 'delta', timestamp: Math.round(s.cts), duration: Math.round(s.dur), data: s.data })); if (d.lazy) s.data = null; while (dec.decodeQueueSize > 6) await sleep(1); }
+    for (let i = a; i < b; i++) { const s = S2[i]; dec.decode(videoChunk(s)); if (d.lazy) s.data = null; while (dec.decodeQueueSize > 6) await sleep(1); }
     await dec.flush(); await Promise.all(copies); dec.close(); if (err) throw err;
     frames.sort((p, q) => q.ts - p.ts);
     for (const f of frames) {
@@ -6341,6 +6499,7 @@ function fpsRational(fps) {
   return { num: Math.round(fps * 1000), den: 1000 };
 }
 async function exportVideoWC(from, to, out) {
+  weldSeams(S.clips);
   const fam0 = (ES.vcodec || (codecOpts(ES.fmt).v[0] || [, ''])[1] || '').slice(0, 4);
   const isMkv = ES.fmt === 'mkv';
   const family = ES.fmt === 'mp4' || isMkv ? ({ avc1: 'avc', hvc1: 'hevc', hev1: 'hevc', av01: 'av1', vp09: 'vp9' }[fam0] || 'avc') : ({ av01: 'av1', vp8: 'vp8' }[fam0] || 'vp9');
@@ -6356,6 +6515,7 @@ async function exportVideoWC(from, to, out) {
   EXP.busy = true; pause(); setSilent(true);
   const cleanup = []; let fileStream = null;
   try {
+    await refreshUsedDisk();
     if (hasAudio) {
       P.update(0, 1, 'Mixando o áudio');
       const aPref = (ES.acodec === 'opus' ? ['opus', 'mp4a.40.2'] : ['mp4a.40.2', 'opus']);
@@ -6392,7 +6552,7 @@ async function exportVideoWC(from, to, out) {
     const readers = new Map(), demux = new Map(), lastUse = new Map();
     flatClips().forEach(c => { if (c.kind === 'video') lastUse.set(c.mediaId, Math.max(lastUse.get(c.mediaId) || 0, c.start + c.dur)); });
     cleanup.push(() => { readers.forEach(r => r.close()); readers.clear(); demux.clear(); });
-    const stalled = new Set(); let stalls = 0;
+    const stalled = new Set(), retries = new Map(); let stalls = 0, lostFrames = 0;
     const getReader = async (c, key) => {
       let r = readers.get(key); if (r) return r;
       const m = MEDIA[c.mediaId]; if (!m || !m.ready) return null;
@@ -6418,10 +6578,21 @@ async function exportVideoWC(from, to, out) {
         const tq = performance.now(); try { f = await r.frameAt(st); }
         catch (e) {
           if (EXP.cancel) throw new Error('cancel');
-          hlog(`decodificador parou em ${st.toFixed(2)}s (${c.name}): ${e && e.message} next=${r.next} de ${r.dm ? r.dm.samples.length : '?'} fila=${r.q ? r.q.length : '?'} dq=${r.dec ? r.dec.decodeQueueSize : '?'} estado=${r.dec ? r.dec.state : '?'} flushed=${r.flushed}`);
-          r.close(); readers.delete(rk); stalled.add(c.id); stalls++;
-          const r2 = await getReader(c, c.id); f = r2 ? await r2.frameAt(st) : null;
+          hlog(`decodificador parou em ${st.toFixed(2)}s (${c.name}): ${e && e.message} next=${r.next} de ${r.dm ? r.dm.samples.length : '?'} fila=${r.q ? r.q.length : '?'} dentro=${r.fed !== undefined ? r.fed - r.out : '?'} estado=${r.dec ? r.dec.state : '?'} flushed=${r.flushed}`);
+          try { r.close(); } catch {} readers.delete(rk);
+          // a new decoder from the key frame before this point (up to 4 times per clip); only after that the slow frame-by-frame reader
+          const tries = (retries.get(c.id) || 0) + 1; retries.set(c.id, tries); let k2 = rk;
+          if (tries > 4 || (e && e.badFile) || r instanceof SeekReader) { if (!stalled.has(c.id)) { stalled.add(c.id); stalls++; } k2 = c.id; }
+          try { const r2 = await getReader(c, k2); f = r2 ? await r2.frameAt(st) : null; }
+          catch (e2) {
+            if (EXP.cancel) throw new Error('cancel');
+            hlog(`nova tentativa falhou em ${st.toFixed(2)}s (${c.name}): ${e2 && e2.message}`);
+            const rx = readers.get(k2); if (rx) { try { rx.close(); } catch {} readers.delete(k2); }
+            if (!stalled.has(c.id)) { stalled.add(c.id); stalls++; }
+            try { const r3 = await getReader(c, c.id); f = r3 ? await r3.frameAt(st) : null; } catch (e3) { hlog(`leitor de segurança falhou em ${st.toFixed(2)}s (${c.name}): ${e3 && e3.message}`); f = null; }
+          }
         }
+        if (!f) lostFrames++;
         PT.dec += performance.now() - tq; if (f) EXPF.set(c.id, f);
       }
       for (const [mid, end] of lastUse) if (end <= t) { demux.delete(mid); lastUse.delete(mid); if (readers.has(mid)) { readers.get(mid).close(); readers.delete(mid); } }
@@ -6445,6 +6616,7 @@ async function exportVideoWC(from, to, out) {
     let check = ''; try { const dm = await demuxMp4({ blob: outBlob }), ax = acodec ? await buildAudioIndex({ id: '__chk', name: 'export', blob: outBlob }) : null;
       if (!dm) check = 'o arquivo gravado não pôde ser lido de volta'; else if (Math.abs(dm.samples.length - N) > 1) check = `o arquivo tem ${dm.samples.length} quadros, eram esperados ${N}`; else if (acodec && !(ax && ax.kind === 'packets' && ax.samples.length)) check = 'a faixa de som não foi encontrada no arquivo';
       else if (acodec) { P.update(N, N, 'Conferindo o som do arquivo'); check = await checkAudioTrack(ax, to - from, refRms); } } catch (e) { check = 'não foi possível conferir o arquivo (' + e.message + ')'; }
+    if (!check && lostFrames) check = `${lostFrames} quadro(s) não puderam ser lidos dos vídeos de origem e saíram sem imagem (o arquivo de origem pode estar incompleto ou ter sido alterado)`;
     if (check) hlog('conferência da exportação: ' + check);
     if (!fileStream && !out.handle) await saveFile(out.name + '.' + ES.fmt, outBlob);
     const secs = (performance.now() - P.t0 - P.paused) / 1000;
@@ -6504,7 +6676,7 @@ async function openTemplates() {
     if (b.dataset.tb) return insertBuiltin(+b.dataset.tb);
     if (b.dataset.ti) return insertProject(b.dataset.ti);
     if (b.dataset.td) { await IDB.proj.del(b.dataset.td); return openTemplates(); }
-    const rec = await IDB.proj.get(b.dataset.tn); if (!rec) return; closeModal(); await saveProjectRecord();
+    const rec = await IDB.proj.get(b.dataset.tn); if (!rec) return; closeModal(); if (!(await leaveOk())) return;
     openProjectRecord({ ...rec, id: uid(), template: false, hist: null, versions: [] }); S.name = rec.name + ' (novo)'; commit('Novo projeto do modelo ' + rec.name); saveProjectRecord(); toast('Projeto novo a partir do modelo ' + rec.name);
   };
 }
@@ -7258,23 +7430,26 @@ function comboOf(e) {
   const name = k === ' ' ? 'Espaço' : k.length === 1 ? k.toUpperCase() : k.replace(/^Arrow/, 'Seta ');
   return [e.ctrlKey || e.metaKey ? 'Ctrl' : '', e.altKey ? 'Alt' : '', e.shiftKey ? 'Shift' : '', name].filter(Boolean).join('+');
 }
+let KEY_GRAB = null;
+function endKeyGrab() { if (KEY_GRAB) { window.removeEventListener('keydown', KEY_GRAB, true); KEY_GRAB = null; } }
 function openKeyEditor() {
+  endKeyGrab();
   const byAct = {}; for (const [c, a] of Object.entries(USER_KEYS)) byAct[a] = c;
   openModal('Personalizar atalhos', `<p class="hint">Clique em "Definir" e aperte a combinação. O seu atalho vale antes do padrão. Esc cancela.</p><div class="kfl" id="kList">${KEY_ACTIONS.map(([id, n]) => `<div><span>${n}</span><code>${byAct[id] ? esc(byAct[id]) : '—'}</code><button class="btn sm" data-kset="${id}">Definir</button>${byAct[id] ? `<button class="ib" data-kclr="${id}" title="Tirar">${ic('trash', 13)}</button>` : ''}</div>`).join('')}</div>`,
     [{ l: 'Voltar aos padrões', a: () => { USER_KEYS = {}; try { localStorage.removeItem('novacut.keys'); } catch {} openKeyEditor(); return false; } }, { l: 'Fechar', pri: true }], true);
   $('#kList').onclick = e => {
     const clr = e.target.closest('[data-kclr]'); if (clr) { for (const [c, a] of Object.entries(USER_KEYS)) if (a === clr.dataset.kclr) delete USER_KEYS[c]; try { localStorage.setItem('novacut.keys', JSON.stringify(USER_KEYS)); } catch {} return openKeyEditor(); }
-    const b = e.target.closest('[data-kset]'); if (!b) return; b.textContent = 'Aperte as teclas…';
+    const b = e.target.closest('[data-kset]'); if (!b) return; endKeyGrab(); document.querySelectorAll('#kList [data-kset]').forEach(x => { x.textContent = 'Definir'; }); b.textContent = 'Aperte as teclas…';
     const grab = ev => {
-      ev.preventDefault(); ev.stopPropagation(); if (['Control', 'Shift', 'Alt', 'Meta'].includes(ev.key)) return;
-      window.removeEventListener('keydown', grab, true); if (ev.key === 'Escape') return openKeyEditor();
+      ev.preventDefault(); ev.stopImmediatePropagation(); if (['Control', 'Shift', 'Alt', 'Meta'].includes(ev.key)) return;
+      endKeyGrab(); if (ev.key === 'Escape') return openKeyEditor();
       const combo = comboOf(ev), id = b.dataset.kset, prev = USER_KEYS[combo];
       for (const [c, a] of Object.entries(USER_KEYS)) if (a === id) delete USER_KEYS[c];
       USER_KEYS[combo] = id; try { localStorage.setItem('novacut.keys', JSON.stringify(USER_KEYS)); } catch {}
       if (prev && prev !== id) toast(`${combo} saiu de "${KEY_ACTIONS.find(x => x[0] === prev)[1]}"`);
       openKeyEditor();
     };
-    window.addEventListener('keydown', grab, true);
+    KEY_GRAB = grab; window.addEventListener('keydown', grab, true); $('#dialog')._close = endKeyGrab;
   };
 }
 window.addEventListener('keydown', e => {
